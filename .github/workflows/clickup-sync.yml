@@ -1,0 +1,167 @@
+# Sinkron status task ClickUp dari aktivitas Git.
+# Alur: branch/commit -> IN DEVELOPMENT, PR ke dev -> CODE REVIEW,
+#       minta perubahan -> REVISI, push perbaikan -> CODE REVIEW,
+#       merge ke dev -> QA/QC, merge ke staging -> STAGING, merge ke main -> LIVE/PRODUCTION.
+# PR ke dev tanpa ID task -> task baru dibuat otomatis di List dan ID ditempel ke judul PR.
+#
+# Butuh:
+#   secrets.CLICKUP_TOKEN    token API pribadi ClickUp (pk_...)
+#   vars.CLICKUP_LIST_ID     ID List yang boleh disentuh (sandbox: 1100470000005127)
+# Pengaman: task di luar CLICKUP_LIST_ID tidak pernah diubah.
+
+name: ClickUp sync
+
+on:
+  create:
+  push:
+    branches-ignore: [main, dev, staging]
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, closed]
+    branches: [dev, staging, main]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: clickup-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'create' || github.event.ref_type == 'branch'
+    steps:
+      - name: Update ClickUp
+        uses: actions/github-script@v7
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_LIST_ID: ${{ vars.CLICKUP_LIST_ID }}
+        with:
+          script: |
+            const TOKEN = process.env.CLICKUP_TOKEN;
+            const LIST_ID = String(process.env.CLICKUP_LIST_ID || '');
+            if (!TOKEN || !LIST_ID) {
+              core.setFailed('CLICKUP_TOKEN (secret) atau CLICKUP_LIST_ID (variable) belum diset.');
+              return;
+            }
+
+            const API = 'https://api.clickup.com/api/v2';
+            const ID_RE = /\bCU-([a-z0-9]{6,12})\b/gi;
+            const ORDER = ['backlog', 'analysis', 'ready for dev', 'in development', 'code review',
+                           'revisi', 'blocked', 'qa/qc', 'staging', 'live/production'];
+            const EARLY = ['backlog', 'analysis', 'ready for dev'];
+            const MERGE_TARGET = { dev: 'qa/qc', staging: 'staging', main: 'live/production' };
+            const rank = (s) => ORDER.indexOf(String(s || '').toLowerCase());
+            const { owner, repo } = context.repo;
+
+            function findIds(...texts) {
+              const out = new Set();
+              for (const t of texts) {
+                if (!t) continue;
+                for (const m of String(t).matchAll(ID_RE)) out.add(m[1]);
+              }
+              return [...out];
+            }
+
+            async function cu(method, path, body) {
+              const res = await fetch(API + path, {
+                method,
+                headers: { Authorization: TOKEN, 'Content-Type': 'application/json' },
+                body: body ? JSON.stringify(body) : undefined,
+              });
+              const text = await res.text();
+              if (!res.ok) throw new Error(`ClickUp ${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`);
+              return text ? JSON.parse(text) : {};
+            }
+
+            // Pindah status dengan pengaman: hanya List sandbox, tidak mundur kecuali diizinkan.
+            async function move(id, target, opts = {}) {
+              let task;
+              try {
+                task = await cu('GET', `/task/${id}`);
+              } catch (e) {
+                core.warning(`CU-${id}: tidak bisa dibaca (${e.message}). Dilewati.`);
+                return;
+              }
+              if (String(task.list && task.list.id) !== LIST_ID) {
+                core.warning(`CU-${id}: bukan di List ${LIST_ID}, tidak diubah.`);
+                return;
+              }
+              const cur = String((task.status && task.status.status) || '').toLowerCase();
+              if (cur === target) return core.info(`CU-${id}: sudah ${target}.`);
+              if (opts.onlyFrom && !opts.onlyFrom.includes(cur)) {
+                return core.info(`CU-${id}: status ${cur}, tidak dipindah ke ${target}.`);
+              }
+              if (opts.forwardOnly && rank(cur) > rank(target)) {
+                return core.info(`CU-${id}: status ${cur} sudah lebih jauh dari ${target}.`);
+              }
+              await cu('PUT', `/task/${id}`, { status: target });
+              core.info(`CU-${id}: ${cur} -> ${target}`);
+            }
+
+            const ev = context.eventName;
+            const p = context.payload;
+            const pr = p.pull_request;
+
+            if (ev === 'create') {
+              for (const id of findIds(p.ref)) await move(id, 'in development', { onlyFrom: EARLY });
+              return;
+            }
+
+            if (ev === 'push') {
+              const branch = context.ref.replace('refs/heads/', '');
+              const msgs = (p.commits || []).map((c) => c.message).join('\n');
+              for (const id of findIds(branch, msgs)) await move(id, 'in development', { onlyFrom: EARLY });
+              return;
+            }
+
+            if (ev === 'pull_request_review') {
+              if (!p.review || p.review.state !== 'changes_requested') return;
+              for (const id of findIds(pr.head.ref, pr.title, pr.body)) {
+                await move(id, 'revisi', { onlyFrom: ['code review'] });
+              }
+              return;
+            }
+
+            if (ev !== 'pull_request') return;
+            let ids = findIds(pr.head.ref, pr.title, pr.body);
+
+            if (p.action === 'closed') {
+              if (!pr.merged) return;
+              const target = MERGE_TARGET[pr.base.ref];
+              if (!target) return;
+              // PR promosi (dev -> staging, staging -> main) membawa banyak task: ambil ID dari semua commit.
+              const commits = await github.paginate(github.rest.pulls.listCommits, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              ids = [...new Set([...ids, ...findIds(commits.map((c) => c.commit.message).join('\n'))])];
+              for (const id of ids) await move(id, target, { forwardOnly: true });
+              return;
+            }
+
+            if (pr.draft || pr.base.ref !== 'dev') return;
+
+            if (p.action === 'synchronize') {
+              for (const id of ids) await move(id, 'code review', { onlyFrom: ['revisi'] });
+              return;
+            }
+
+            // opened / reopened / ready_for_review ke dev
+            if (ids.length === 0) {
+              const task = await cu('POST', `/list/${LIST_ID}/task`, {
+                name: pr.title,
+                description: `Dibuat otomatis dari PR #${pr.number} (${pr.html_url}) oleh @${pr.user.login}.`,
+                status: 'code review',
+              });
+              await github.rest.pulls.update({ owner, repo, pull_number: pr.number, title: `${pr.title} [CU-${task.id}]` });
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number,
+                body: `PR ini belum punya task ClickUp, jadi dibuatkan otomatis: ${task.url} (CU-${task.id}).`,
+              });
+              core.info(`Task baru CU-${task.id} dibuat untuk PR #${pr.number}.`);
+              return;
+            }
+            for (const id of ids) await move(id, 'code review', { forwardOnly: true });
